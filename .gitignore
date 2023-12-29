@@ -1,3 +1,6 @@
 mimpirun
 examples_build/
 assignment.zip
+.vscode
+Info.plist
+mimpirun.yml
