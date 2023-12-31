@@ -18,9 +18,9 @@ int main(int argc, char* argv[]) {
 
     ASSERT_SYS_OK(setenv("MIMPI_WORLD_SIZE", argv[1], 1));
 
-    int pipes[n][2];
+    int pipes[n * n][2];
 
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n * n; i++) {
         ASSERT_SYS_OK(channel(pipes[i]));
         if (pipes[i][1] != 20 + 2 * i) {
             ASSERT_SYS_OK(dup2(pipes[i][0], 20 + 2 * i));
@@ -39,6 +39,7 @@ int main(int argc, char* argv[]) {
                 ASSERT_SYS_OK(close(pipes[i][0]));
         }
     }
+
     // Create n children
     for (int i = 0; i < n; i++) {
         pid_t pid = fork();
@@ -53,13 +54,13 @@ int main(int argc, char* argv[]) {
         }
     }
     // Close all pipes
-    for (int i = 20; i < 20 + 2 * n; i++) {
+    for (int i = 20; i < 20 + 2 * n * n; i++) {
         ASSERT_SYS_OK(close(i));
     }
     // Wait for all children
     for (int i = 0; i < n; i++) {
         ASSERT_SYS_OK(wait(NULL));
     }
-    
+
     return 0;
 }
