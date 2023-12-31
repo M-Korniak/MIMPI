@@ -4,9 +4,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <fcntl.h>
+#include <math.h>
+
 #include <pthread.h>
 #include <string.h>
+#include <errno.h>
 
 
 #include "channel.h"
@@ -14,6 +16,9 @@
 #include "mimpi_common.h"
 
 #define BUFF_SIZE 512
+#define FINISH_TAG -1
+#define BARRIER_TAG -2
+#define BROKEN_BARRIER_TAG -3
 
 typedef struct message_t {
     int process_number;
@@ -34,6 +39,7 @@ static int world_size;
 static int world_rank;
 static int read_pipe_dsc;
 static int finished_processes_count = 0;
+static int broken_barrier = 0;
 
 static int* write_pipe_dsc;
 static int* finished_processes;
@@ -97,15 +103,20 @@ void list_free(list* l) {
 static void* reading_thread(void* data) {
     while(true) {
         // Process number
-        ASSERT_SYS_OK(chrecv(read_pipe_dsc, receive_buffer, sizeof(int)));
-        int process_number = *(int*)receive_buffer;
-        if (process_number == -1) {
+        int ret = chrecv(read_pipe_dsc, receive_buffer, sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
             break;
         }
+        ASSERT_SYS_OK(ret);
+        int process_number = *(int*)receive_buffer;
         // Tag
-        ASSERT_SYS_OK(chrecv(read_pipe_dsc, receive_buffer, sizeof(int)));
+        ret = chrecv(read_pipe_dsc, receive_buffer, sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+            break;
+        }
+        ASSERT_SYS_OK(ret);
         int tag = *(int*)receive_buffer;
-        if (tag == -1) {
+        if (tag == FINISH_TAG) {
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
             finished_processes[process_number] = 1;
@@ -119,13 +130,58 @@ static void* reading_thread(void* data) {
             continue;
         }
         // Count
-        ASSERT_SYS_OK(chrecv(read_pipe_dsc, receive_buffer, sizeof(int)));
+        ret = chrecv(read_pipe_dsc, receive_buffer, sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+            break;
+        }
+        ASSERT_SYS_OK(ret);
         int count = *(int*)receive_buffer;
+        if (tag == BARRIER_TAG) {
+            // Mutex lock
+            ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+        
+
+            // Create message
+            message* m = malloc(sizeof(message));
+            assert(m != NULL);
+            m->process_number = process_number;
+            m->tag = tag;
+            m->count = 0;
+            m->read_bytes = 0;
+            m->data = NULL;
+            m->next = NULL;
+            m->prev = NULL;
+            list_append(messages, m);
+
+            // Signal main thread
+            ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            // Mutex unlock
+            ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+            continue;
+        }
+        else if (tag == BROKEN_BARRIER_TAG) {
+            // Mutex lock
+            ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+            broken_barrier = 1;
+            // Signal main thread
+            ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            // Mutex unlock
+            ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+            continue;
+        }
         // Bytes to read
-        ASSERT_SYS_OK(chrecv(read_pipe_dsc, receive_buffer, sizeof(int)));
+        ret = chrecv(read_pipe_dsc, receive_buffer, sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+            break;
+        }
+        ASSERT_SYS_OK(ret);
         int to_read = *(int*)receive_buffer;
         // Read data
-        ASSERT_SYS_OK(chrecv(read_pipe_dsc, receive_buffer, to_read));
+        ret = chrecv(read_pipe_dsc, receive_buffer, to_read);
+        if (ret == -1 && errno == EBADF) {
+            break;
+        }
+        ASSERT_SYS_OK(ret);
         // Mutex lock
         ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
         // Create message
@@ -191,12 +247,6 @@ void MIMPI_Init(bool enable_deadlock_detection) {
         }
     }
 
-    // for (int i = 20; i < 1024; i++) {
-    //     if (fcntl(i, F_GETFD) != -1) {
-    //         printf("File descriptor %d is open in process %d.\n", i, world_rank);
-    //     }
-    // }
-
     // Initialize mutex and condition variables
     ASSERT_SYS_OK(pthread_mutex_init(&mutex, NULL));
     ASSERT_SYS_OK(pthread_cond_init(&main_waiting, NULL));
@@ -226,29 +276,119 @@ void MIMPI_Init(bool enable_deadlock_detection) {
     
 }
 
+void* send_finish(void* arg) {
+    int destination = *(int*)arg;
+    int left = 2 * destination + 1;
+    int right = 2 * destination + 2;
+    pthread_t right_thread_id;
+    // Create local buffer
+    void* local_buffer = malloc(2 * sizeof(int));
+    if (destination != world_rank && finished_processes[destination] == 0) {
+            *(int*)local_buffer = world_rank;
+            *(int*)(local_buffer + sizeof(int)) = FINISH_TAG;
+            printf("Process %d sending finish to %d\n", world_rank, destination);
+            int ret = chsend(write_pipe_dsc[destination], local_buffer, 2 * sizeof(int));
+            if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+                free(local_buffer);
+                return NULL;
+            }
+            ASSERT_SYS_OK(ret);
+    }
+    if (right < world_size) {
+        // Create thread for right child
+        ASSERT_ZERO(pthread_create(&right_thread_id, NULL, send_finish, &right));
+    }
+    if (left < world_size) {
+        send_finish(&left);
+    }
+    if (right < world_size) {
+        ASSERT_ZERO(pthread_join(right_thread_id, NULL));
+    }
+    free(local_buffer);
+    return NULL;
+}
+
+void* create_send(void* arg) {
+    int destination = *(int*)arg;
+    int left = 2 * destination + 1;
+    int right = 2 * destination + 2;
+    pthread_t left_thread_id;
+    pthread_t right_thread_id;
+    if (left < world_size) {
+        // Create thread for left child
+        printf("Process %d creating thread for %d\n", world_rank, left);
+        ASSERT_ZERO(pthread_create(&left_thread_id, NULL, create_send, &left));
+    }
+    if (right < world_size) {
+        // Create thread for right child
+        printf("Process %d creating thread for %d\n", world_rank, right);
+        ASSERT_ZERO(pthread_create(&right_thread_id, NULL, create_send, &right));
+    }
+    void* local_buffer = malloc(2 * sizeof(int));
+    if (destination != world_rank && finished_processes[destination] == 0) {
+            *(int*)local_buffer = world_rank;
+            *(int*)(local_buffer + sizeof(int)) = FINISH_TAG;
+            printf("Process %d sending finish to %d\n", world_rank, destination);
+            int ret = chsend(write_pipe_dsc[destination], local_buffer, 2 * sizeof(int));
+            if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+                free(local_buffer);
+                return NULL;
+            }
+            ASSERT_SYS_OK(ret);
+    }
+    if (left < world_size) {
+        printf("Process %d waiting for %d\n", world_rank, left);
+        ASSERT_ZERO(pthread_join(left_thread_id, NULL));
+    }
+    if (right < world_size) {
+        printf("Process %d waiting for %d\n", world_rank, right);
+        ASSERT_ZERO(pthread_join(right_thread_id, NULL));
+    }
+    free(local_buffer);
+    printf("Process %d with destiantion %d finished\n", world_rank, destination);
+    return NULL;
+}
 void MIMPI_Finalize() {
+    // Close reading pipe
+    ASSERT_SYS_OK(close(read_pipe_dsc));
 
-    // Send finishing signal to all processes
-    for (int i = 0; i < world_size; i++) {
-        if (i != world_rank) {
-            *(int*)send_buffer = world_rank;
-            *(int*)(send_buffer + sizeof(int)) = -1;
-            ASSERT_SYS_OK(chsend(write_pipe_dsc[i], send_buffer, 2 * sizeof(int)));
-        }
-    }
-    // Wait for all processes to finish
-    ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
-    finished_processes_count++;
+    int arg = 0;
+    create_send(&arg);
+    
+    // pthread_t* threads = malloc(world_rank * sizeof(pthread_t));
 
-    // print finished_processes_count
-    while (finished_processes_count < world_size) {
-        ASSERT_SYS_OK(pthread_cond_wait(&main_waiting, &mutex));
-    }
-    ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+    // int* args = malloc(world_rank * sizeof(int));
+
+    // // Create threads
+    // for (int i = 0; i < world_rank; i++) {
+    //     args[i] = i;
+    //     ASSERT_ZERO(pthread_create(&threads[i], NULL, send_signal, &args[i]));
+    // }
+
+    // // Wait for threads to finish
+    // for (int i = 0; i < world_rank; i++) {
+    //     ASSERT_ZERO(pthread_join(threads[i], NULL));    
+    // }
+
+    // free(threads);
+    // free(args);
+
+
+
+    // // Send finishing signal to all processes
+    // for (int i = 0; i < world_size; i++) {
+    //     if (i != world_rank) {
+    //         *(int*)send_buffer = world_rank;
+    //         *(int*)(send_buffer + sizeof(int)) = FINISH_TAG;
+    //         int ret = chsend(write_pipe_dsc[i], send_buffer, 2 * sizeof(int));
+    //         if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+    //             continue;
+    //         }
+    //         ASSERT_SYS_OK(ret);
+    //     }
+    // }
 
     // Send stopping signal to thread and wait for it to finish
-    *(int*)send_buffer = -1;
-    ASSERT_SYS_OK(chsend(write_pipe_dsc[world_rank], send_buffer, sizeof(int)));
     ASSERT_ZERO(pthread_join(reading_thread_id, NULL));
 
     // Close mutex and condition variables
@@ -256,7 +396,6 @@ void MIMPI_Finalize() {
     ASSERT_SYS_OK(pthread_cond_destroy(&main_waiting));
 
     // Close pipes
-    ASSERT_SYS_OK(close(read_pipe_dsc));
     for (int i = 0; i < world_size; i++) {
         ASSERT_SYS_OK(close(write_pipe_dsc[i]));
     }
@@ -275,6 +414,7 @@ void MIMPI_Finalize() {
     free(messages_to_process);
     list_free(messages);
 
+    printf("Process %d finished\n", world_rank);
     channels_finalize();
 }
 
@@ -295,37 +435,37 @@ MIMPI_Retcode MIMPI_Send(
     if (destination < 0 || destination >= world_size) {
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
+    if (destination == world_rank && (tag == BARRIER_TAG || tag == BROKEN_BARRIER_TAG)) {
+        return MIMPI_SUCCESS;
+    }
     if (destination == world_rank) {
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
-    ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
-    if (finished_processes[destination]) {
-        ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
-        return MIMPI_ERROR_REMOTE_FINISHED;
-    }
-    ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
-    
 
     void const *data_index = data;
     *(int*)send_buffer = world_rank;
     *(int*)(send_buffer + sizeof(int)) = tag;
     *(int*)(send_buffer + 2 * sizeof(int)) = count;
 
+    if (count == 0) {
+        int ret = chsend(write_pipe_dsc[destination], send_buffer, 3 * sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+            return MIMPI_ERROR_REMOTE_FINISHED;
+        }
+    }
+
     while (count > 0) {
         int to_write = count > BUFF_SIZE - 4 * sizeof(int) ? BUFF_SIZE - 4 * sizeof(int) : count;
         *(int*)(send_buffer + 3 * sizeof(int)) = to_write;
         memcpy(send_buffer + 4 * sizeof(int), data_index, to_write);
-        ASSERT_SYS_OK(chsend(write_pipe_dsc[destination], send_buffer, to_write + 4 * sizeof(int)));
+        int ret = chsend(write_pipe_dsc[destination], send_buffer, to_write + 4 * sizeof(int));
+        if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
+            return MIMPI_ERROR_REMOTE_FINISHED;
+        }
+        ASSERT_SYS_OK(ret);
         data_index += to_write;
         count -= to_write;
     }
-
-    ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
-    if (finished_processes[destination]) {
-        ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
-        return MIMPI_ERROR_REMOTE_FINISHED;
-    }
-    ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
     
     return MIMPI_SUCCESS;
 }
@@ -333,7 +473,7 @@ MIMPI_Retcode MIMPI_Send(
 static int look_for_message(int source, int tag, int count) {
     message* m = messages->head;
     while (m != NULL) {
-        if (m->process_number == source && (m->tag == tag || tag == 0) && m->count == count) {
+        if (m->process_number == source && (m->tag == tag || (tag == 0 && m->tag > 0)) && m->count == count) {
             return 1;
         }
         m = m->next;
@@ -350,22 +490,28 @@ MIMPI_Retcode MIMPI_Recv(
     if (source < 0 || source >= world_size) {
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
+    if (source == world_rank && (tag == BARRIER_TAG || tag == BROKEN_BARRIER_TAG)) {
+        return MIMPI_SUCCESS;
+    }
     if (source == world_rank) {
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
 
     // Mutex lock
     ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
-  
-    while (!look_for_message(source, tag, count) && finished_processes[source] == 0) {
+    
+    while (!look_for_message(source, tag, count) && finished_processes[source] == 0 
+            && broken_barrier == 0) {
         ASSERT_SYS_OK(pthread_cond_wait(&main_waiting, &mutex));
     }
+
 
     // Look for message
     message* m = messages->head;
     while (m != NULL) {
-        if (m->process_number == source && (m->tag == tag || tag == 0) && m->count == count) {
-            memcpy(data, m->data, count);
+        if (m->process_number == source && (m->tag == tag || (tag == 0 && m->tag > 0)) && m->count == count) {
+            if (data != NULL)
+                memcpy(data, m->data, count);
             list_remove(messages, m);
             free(m->data);
             free(m);
@@ -380,8 +526,31 @@ MIMPI_Retcode MIMPI_Recv(
     return MIMPI_ERROR_REMOTE_FINISHED;
 }
 
+
 MIMPI_Retcode MIMPI_Barrier() {
-    TODO
+    int value_to_return = MIMPI_SUCCESS;
+    int ret = 0;
+    int local_finished_processes[16];
+    for (int i = 0; i < log2(world_size); i++) {
+        // TODO avoid sending to yourself
+        int partner = (world_rank + (1 << i)) % world_size;
+    
+        if (value_to_return == MIMPI_SUCCESS)
+            ret = MIMPI_Send(NULL, 0, partner, BARRIER_TAG);
+        else if (value_to_return == MIMPI_ERROR_REMOTE_FINISHED) 
+            MIMPI_Send(NULL, 0, partner, BROKEN_BARRIER_TAG);
+        if (ret == MIMPI_ERROR_REMOTE_FINISHED) 
+            value_to_return = MIMPI_ERROR_REMOTE_FINISHED;
+        int previous = (world_rank - (1 << i) + world_size) % world_size;
+        if (value_to_return == MIMPI_SUCCESS) {
+            ret = MIMPI_Recv(NULL, 0, previous, BARRIER_TAG);
+            //local_finished_processes[previous] = 1;
+        }
+        if (ret == MIMPI_ERROR_REMOTE_FINISHED) 
+            value_to_return = MIMPI_ERROR_REMOTE_FINISHED;
+    }
+    
+    return value_to_return;
 }
 
 MIMPI_Retcode MIMPI_Bcast(
