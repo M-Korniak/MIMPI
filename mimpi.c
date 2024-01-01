@@ -332,6 +332,9 @@ void MIMPI_Finalize() {
     free(write_pipe_dsc);
     free(finished_processes);
     free(send_buffer);
+    for (int i = 0; i < world_size; i++) {
+        free(receive_buffer[i]);
+    }
     free(receive_buffer);
     for (int i = 0; i < world_size; i++) {
         if (messages_to_process[i] != NULL) {
@@ -483,24 +486,36 @@ MIMPI_Retcode MIMPI_Barrier() {
     return value_to_return;
 }
 
+void set_family(int* rank, int *left, int *right, int *parent, int root) {
+    if (*rank == root) 
+        *rank = 0;
+    else if (*rank == 0)
+        *rank = root;
+    *left = 2 * (*rank) + 1;
+    if (*left == root)
+        *left = 0;
+    *right = 2 * (*rank) + 2;
+    if (*right == root)
+        *right = 0;
+    *parent = (*rank - 1) / 2;
+    if (*parent == root)
+        *parent = 0;
+    else if (*parent == 0)
+        *parent = root;
+}
+
 MIMPI_Retcode MIMPI_Bcast(
     void *data,
     int count,
     int root
 ) {
-    int left = 2 * world_rank + 1;
-    int right = 2 * world_rank + 2;
-    int parent = (world_rank - 1) / 2;
     if (root < 0 || root >= world_size) {
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
-    if (root == world_rank && world_rank != 0) {
-        MIMPI_Send(data, count, 0, BCAST_TAG);
-    }
-    if (world_rank == 0 && root != 0) {
-        MIMPI_Recv(data, count, root, BCAST_TAG);
-    }
-    if (world_rank > 0) {
+    int rank = world_rank;
+    int left, right, parent;
+    set_family(&rank, &left, &right, &parent, root);
+    if (rank > 0) {
         MIMPI_Recv(data, count, parent, BCAST_TAG);
     }
     if (left < world_size) {
@@ -515,13 +530,38 @@ MIMPI_Retcode MIMPI_Bcast(
     if (right < world_size) {
         MIMPI_Recv(NULL, 0, right, BARRIER_TAG);
     }
-    if (world_rank != 0) {
+    if (rank != 0) {
         MIMPI_Send(NULL, 0, parent, BARRIER_TAG);
     }
-    // TODO BARIERA
     return MIMPI_SUCCESS;
 }
 
+void modify_buffer(void* buffer, const void* modyfing_buffer, int count, MIMPI_Op op) {
+    if (op == MIMPI_SUM) {
+        for (int i = 0; i < count; i++) {
+            ((uint8_t*)buffer)[i] += ((uint8_t*)modyfing_buffer)[i];
+        }
+    }
+    else if (op == MIMPI_PROD) {
+        for (int i = 0; i < count; i++) {
+            ((uint8_t*)buffer)[i] *= ((uint8_t*)modyfing_buffer)[i];
+        }
+    }
+    else if (op == MIMPI_MAX) {
+        for (int i = 0; i < count; i++) {
+            if (((uint8_t*)buffer)[i] < ((uint8_t*)modyfing_buffer)[i]) {
+                ((uint8_t*)buffer)[i] = ((uint8_t*)modyfing_buffer)[i];
+            }
+        }
+    }
+    else if (op == MIMPI_MIN) {
+        for (int i = 0; i < count; i++) {
+            if (((uint8_t*)buffer)[i] > ((uint8_t*)modyfing_buffer)[i]) {
+                ((uint8_t*)buffer)[i] = ((uint8_t*)modyfing_buffer)[i];
+            }
+        }
+    }
+}
 MIMPI_Retcode MIMPI_Reduce(
     void const *send_data,
     void *recv_data,
@@ -529,5 +569,45 @@ MIMPI_Retcode MIMPI_Reduce(
     MIMPI_Op op,
     int root
 ) {
-    TODO
+    if (root < 0 || root >= world_size) {
+        return MIMPI_ERROR_NO_SUCH_RANK;
+    }
+    int rank = world_rank;
+    int left, right, parent;
+    set_family(&rank, &left, &right, &parent, root);
+    uint8_t* buffer_left = malloc(count);
+    assert(buffer_left != NULL);
+    uint8_t* buffer_right = malloc(count);
+    assert(buffer_right != NULL);
+    uint8_t* buffer = malloc(count);
+    assert(buffer != NULL);
+    modify_buffer(buffer, send_data, count, op);
+    if (left < world_size) {
+        MIMPI_Recv(buffer_left, count, left, BCAST_TAG);
+        modify_buffer(buffer, buffer_left, count, op);
+    }
+    if (right < world_size) {
+        MIMPI_Recv(buffer_right, count, right, BCAST_TAG);
+        modify_buffer(buffer, buffer_right, count, op);
+    }
+    if (rank != 0) {
+        MIMPI_Send(buffer, count, parent, BCAST_TAG);
+    }
+    else {
+        memcpy(recv_data, buffer, count);
+    }
+    if (left < world_size) {
+        MIMPI_Send(NULL, 0, left, BARRIER_TAG);
+    }
+    if (right < world_size) {
+        MIMPI_Send(NULL, 0, right, BARRIER_TAG);
+    }
+    if (rank != 0) {
+        MIMPI_Recv(NULL, 0, parent, BARRIER_TAG);
+    }
+
+    free(buffer_left);
+    free(buffer_right);
+    free(buffer);
+    return MIMPI_SUCCESS;
 }
