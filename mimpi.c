@@ -19,6 +19,7 @@
 #define BARRIER_TAG -2
 #define BROKEN_BARRIER_TAG -3
 
+
 typedef struct message_t {
     int process_number;
     int tag;
@@ -39,6 +40,8 @@ static int world_rank;
 static int finished_processes_count = 0;
 static int broken_barrier = 0;
 static int receive_from = -1;
+static bool deadlock_on = false;
+
 
 static int* args;
 static int* read_pipe_dsc;
@@ -47,6 +50,8 @@ static int* finished_processes;
 static void* send_buffer;
 static void** receive_buffer;
 static list* messages;
+static list* incoming = NULL;
+static list* outgoing = NULL;
 static message** messages_to_process;
 static pthread_t* reading_threads;
 static pthread_mutex_t mutex;
@@ -108,11 +113,22 @@ void actualize_finished_processes(int i) {
     finished_processes_count++;
 
     // Signal main thread
-    ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+    if (receive_from == i) {
+        ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+    }
+    
 
     // Mutex unlock
     ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
 }
+
+int hash_tag(int tag) {
+    return -(tag + 16);
+}
+int unhash_tag(int tag) {
+    return -tag - 16;
+}
+
 static void* reading_thread(void* data) {
     int source = *(int*)data;
     int read_pipe = read_pipe_dsc[source];
@@ -153,17 +169,57 @@ static void* reading_thread(void* data) {
             list_append(messages, m);
 
             // Signal main thread
-            ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            if (receive_from == source) {
+                ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            }
             // Mutex unlock
             ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
             continue;
         }
-        else if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
+        else if (tag == BROKEN_BARRIER_TAG) {
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
             broken_barrier = 1;
             // Signal main thread
             ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            // Mutex unlock
+            ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+            continue;
+        }
+        else if (deadlock_on && tag <= 0) {
+            tag = unhash_tag(tag);
+            assert(tag >= 0);
+            // Mutex lock
+            ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+            // Search for outgoing message
+            message* m = outgoing->head;
+            while (m != NULL) {
+                if (m->process_number == source && (m->tag == tag || tag == 0)
+                     && m->count == count) {
+                    list_remove(outgoing, m);
+                    free(m);
+                    // Mutex unlock
+                    ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+                    continue;
+                }
+                m = m->next;
+            }
+            // If not found, add to incoming list
+            m = malloc(sizeof(message));
+            assert(m != NULL);
+            m->process_number = source;
+            m->tag = tag;
+            m->count = count;
+            m->read_bytes = 0;
+            m->data = NULL;
+            m->next = NULL;
+            m->prev = NULL;
+            list_append(incoming, m);
+
+            // Signal main thread
+            if (receive_from == source) {
+                ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            }
             // Mutex unlock
             ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
             continue;
@@ -208,7 +264,9 @@ static void* reading_thread(void* data) {
         if (messages_to_process[source]->read_bytes == messages_to_process[source]->count) {
             list_append(messages, messages_to_process[source]);
             messages_to_process[source] = NULL;
-            ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            if (receive_from == source) {
+                ASSERT_SYS_OK(pthread_cond_signal(&main_waiting));
+            }
         }
         // Mutex unlock
         ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
@@ -285,6 +343,18 @@ void MIMPI_Init(bool enable_deadlock_detection) {
     for (int i = 0; i < world_size; i++) {
         messages_to_process[i] = NULL;
     }
+
+    // Enable deadlock detection
+    deadlock_on = enable_deadlock_detection;
+    if (deadlock_on) {
+       // Alloc memory for lists of incoming and outgoing messages
+        incoming = malloc(sizeof(list));
+        assert(incoming != NULL);
+        list_init(incoming);
+        outgoing = malloc(sizeof(list));
+        assert(outgoing != NULL);
+        list_init(outgoing);
+    }
     
     // Create reading threads
     reading_threads = malloc(sizeof(pthread_t) * world_size);
@@ -300,6 +370,7 @@ void MIMPI_Init(bool enable_deadlock_detection) {
 
 
 void MIMPI_Finalize() {
+
     // Close all reading pipes
     for (int i = 0; i < world_size; i++) {
         if (i != world_rank) {
@@ -344,6 +415,11 @@ void MIMPI_Finalize() {
     }
     free(messages_to_process);
     list_free(messages);
+    if (deadlock_on) {
+        // Free memory for lists of incoming and outgoing messages
+        list_free(incoming);
+        list_free(outgoing);
+    }
 
     channels_finalize();
 }
@@ -396,6 +472,38 @@ MIMPI_Retcode MIMPI_Send(
         data_index += to_write;
         count -= to_write;
     }
+    if (deadlock_on && tag >= 0) {
+        // Mutex lock
+        ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+        // Search for incoming message
+        message* m = incoming->head;
+        while (m != NULL) {
+            if (m->process_number == destination && (m->tag == tag || tag == 0) 
+            && m->count == count) {
+                list_remove(incoming, m);
+                free(m->data);
+                free(m);
+                // Mutex unlock
+                ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+                return MIMPI_SUCCESS;
+            }
+            m = m->next;
+        }
+        // If not found, add to outgoing list
+        m = malloc(sizeof(message));
+        assert(m != NULL);
+        m->process_number = destination;
+        m->tag = tag;
+        m->count = count;
+        m->read_bytes = 0;
+        m->data = NULL;
+        m->next = NULL;
+        m->prev = NULL;
+        list_append(outgoing, m);
+        // Mutex unlock
+        ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+        
+    }
     
     return MIMPI_SUCCESS;
 }
@@ -428,13 +536,19 @@ MIMPI_Retcode MIMPI_Recv(
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
 
+     if (deadlock_on) {
+        int temp_tag = hash_tag(tag);
+        MIMPI_Send(NULL, 0, source, temp_tag);
+    }
+
     // Mutex lock
     ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+
 
     receive_from = source;
 
     while (!look_for_message(source, tag, count) && finished_processes[source] == 0 
-            && broken_barrier == 0) {
+            && broken_barrier == 0 && (deadlock_on == false || incoming->head == NULL)) {
         ASSERT_SYS_OK(pthread_cond_wait(&main_waiting, &mutex));
     }
 
@@ -443,7 +557,8 @@ MIMPI_Retcode MIMPI_Recv(
     // Look for message
     message* m = messages->head;
     while (m != NULL) {
-        if (m->process_number == source && (m->tag == tag || (tag == 0 && m->tag > 0)) && m->count == count) {
+        if (m->process_number == source && (m->tag == tag 
+        || (tag == 0 && m->tag > 0)) && m->count == count) {
             if (data != NULL)
                 memcpy(data, m->data, count);
             list_remove(messages, m);
@@ -453,6 +568,11 @@ MIMPI_Retcode MIMPI_Recv(
             return MIMPI_SUCCESS;
         }
         m = m->next;
+    }
+
+    if (deadlock_on && incoming->head != NULL) {
+        ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+        return MIMPI_ERROR_DEADLOCK_DETECTED;
     }
 
     // Mutex unlock
