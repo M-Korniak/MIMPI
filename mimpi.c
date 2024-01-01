@@ -581,11 +581,18 @@ MIMPI_Retcode MIMPI_Recv(
     return MIMPI_ERROR_REMOTE_FINISHED;
 }
 
+int log_2(int n) {
+    int log = 0;
+    while (n >>= 1) {
+        ++log;
+    }
+    return log;
+}
 
 MIMPI_Retcode MIMPI_Barrier() {
     int value_to_return = MIMPI_SUCCESS;
     int ret = 0;
-    for (int i = 0; i < log2(world_size); i++) {
+    for (int i = 0; i < log_2(world_size - 1) + 1; i++) {
 
         int partner = (world_rank + (1 << i)) % world_size;
     
