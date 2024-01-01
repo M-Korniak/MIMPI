@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h>
 
 #include "channel.h"
 #include "mimpi.h"
