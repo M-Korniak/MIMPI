@@ -709,7 +709,7 @@ MIMPI_Retcode MIMPI_Reduce(
     assert(buffer_right != NULL);
     uint8_t* buffer = malloc(count);
     assert(buffer != NULL);
-    modify_buffer(buffer, send_data, count, op);
+    memcpy(buffer, send_data, count);
     if (left < world_size) {
         MIMPI_Recv(buffer_left, count, left, BCAST_TAG);
         modify_buffer(buffer, buffer_left, count, op);
