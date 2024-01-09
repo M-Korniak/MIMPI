@@ -379,6 +379,7 @@ void MIMPI_Finalize() {
         }
     }
 
+
     // Close all the writing pipes
     for (int i = 0; i < world_size; i++) {
         if (i != world_rank) {
@@ -453,15 +454,15 @@ MIMPI_Retcode MIMPI_Send(
     *(int*)send_buffer = tag;
     *(int*)(send_buffer + sizeof(int)) = count;
 
-    if (count == 0) {
+    if (count == 0 || data == NULL) {
         int ret = chsend(write_pipe_dsc[destination], send_buffer, 2 * sizeof(int));
         if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
         ASSERT_SYS_OK(ret);
     }
-
-    while (count > 0) {
+   
+    while (count > 0 && data != NULL) {
         int to_write = count > BUFF_SIZE - 3 * sizeof(int) ? BUFF_SIZE - 3 * sizeof(int) : count;
         *(int*)(send_buffer + 2 * sizeof(int)) = to_write;
         memcpy(send_buffer + 3 * sizeof(int), data_index, to_write);
@@ -473,6 +474,7 @@ MIMPI_Retcode MIMPI_Send(
         data_index += to_write;
         count -= to_write;
     }
+    
     if (deadlock_on && tag >= 0) {
         // Mutex lock
         ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
@@ -505,7 +507,6 @@ MIMPI_Retcode MIMPI_Send(
         ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
         
     }
-    
     return MIMPI_SUCCESS;
 }
 
@@ -520,12 +521,23 @@ static int look_for_message(int source, int tag, int count) {
     return 0;
 }
 
+int is_message_from_source(int source) {
+    message* m = incoming->head;
+    while (m != NULL) {
+        if (m->process_number == source && m->tag >= 0) {
+            return 1;
+        }
+        m = m->next;
+    }
+    return 0;
+}
 MIMPI_Retcode MIMPI_Recv(
     void *data,
     int count,
     int source,
     int tag
 ) {
+    
     if (source < 0 || source >= world_size) {
         return MIMPI_ERROR_NO_SUCH_RANK;
     }
@@ -536,10 +548,10 @@ MIMPI_Retcode MIMPI_Recv(
     if (source == world_rank) {
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
-
-     if (deadlock_on) {
+    
+    if (deadlock_on) {
         int temp_tag = hash_tag(tag);
-        MIMPI_Send(NULL, 0, source, temp_tag);
+        MIMPI_Send(NULL, count, source, temp_tag);
     }
 
     // Mutex lock
@@ -549,7 +561,7 @@ MIMPI_Retcode MIMPI_Recv(
     receive_from = source;
 
     while (!look_for_message(source, tag, count) && finished_processes[source] == 0 
-            && broken_barrier == 0 && (deadlock_on == false || incoming->head == NULL)) {
+            && broken_barrier == 0 && (deadlock_on == false || is_message_from_source(source) == 0)) {
         ASSERT_SYS_OK(pthread_cond_wait(&main_waiting, &mutex));
     }
 
@@ -571,11 +583,10 @@ MIMPI_Retcode MIMPI_Recv(
         m = m->next;
     }
 
-    if (deadlock_on && incoming->head != NULL) {
+    if (deadlock_on && is_message_from_source(source)) {
         ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
         return MIMPI_ERROR_DEADLOCK_DETECTED;
     }
-
     // Mutex unlock
     ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
     return MIMPI_ERROR_REMOTE_FINISHED;
