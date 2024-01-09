@@ -143,7 +143,7 @@ static void* reading_thread(void* data) {
         }
         ASSERT_SYS_OK(ret);
         int tag = *(int*)buffer;
-
+    
         // Count
         ret = chrecv(read_pipe, buffer, sizeof(int));
         if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
@@ -155,7 +155,6 @@ static void* reading_thread(void* data) {
         if (tag == BARRIER_TAG) {
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
-        
 
             // Create message
             message* m = malloc(sizeof(message));
@@ -187,13 +186,14 @@ static void* reading_thread(void* data) {
             ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
             continue;
         }
-        else if (deadlock_on && tag <= 0) {
+        else if (deadlock_on && tag < 0) {
             tag = unhash_tag(tag);
             assert(tag >= 0);
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
             // Search for outgoing message
             message* m = outgoing->head;
+            int out = 0;
             while (m != NULL) {
                 if (m->process_number == source && (m->tag == tag || tag == 0)
                      && m->count == count) {
@@ -201,10 +201,13 @@ static void* reading_thread(void* data) {
                     free(m);
                     // Mutex unlock
                     ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+                    out = 1;
                     continue;
                 }
                 m = m->next;
             }
+            if (out) 
+                continue;
             // If not found, add to incoming list
             m = malloc(sizeof(message));
             assert(m != NULL);
@@ -450,6 +453,8 @@ MIMPI_Retcode MIMPI_Send(
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
 
+    int const initial_count = count;
+
     void const *data_index = data;
     *(int*)send_buffer = tag;
     *(int*)(send_buffer + sizeof(int)) = count;
@@ -482,7 +487,7 @@ MIMPI_Retcode MIMPI_Send(
         message* m = incoming->head;
         while (m != NULL) {
             if (m->process_number == destination && (m->tag == tag || tag == 0) 
-            && m->count == count) {
+            && m->count == initial_count) {
                 list_remove(incoming, m);
                 free(m->data);
                 free(m);
@@ -497,7 +502,7 @@ MIMPI_Retcode MIMPI_Send(
         assert(m != NULL);
         m->process_number = destination;
         m->tag = tag;
-        m->count = count;
+        m->count = initial_count;
         m->read_bytes = 0;
         m->data = NULL;
         m->next = NULL;
@@ -549,7 +554,7 @@ MIMPI_Retcode MIMPI_Recv(
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
     
-    if (deadlock_on) {
+    if (deadlock_on && tag >= 0) {
         int temp_tag = hash_tag(tag);
         MIMPI_Send(NULL, count, source, temp_tag);
     }
@@ -561,7 +566,8 @@ MIMPI_Retcode MIMPI_Recv(
     receive_from = source;
 
     while (!look_for_message(source, tag, count) && finished_processes[source] == 0 
-            && broken_barrier == 0 && (deadlock_on == false || is_message_from_source(source) == 0)) {
+            && broken_barrier == 0 && (deadlock_on == false 
+            || tag < 0 || is_message_from_source(source) == 0)) {
         ASSERT_SYS_OK(pthread_cond_wait(&main_waiting, &mutex));
     }
 
@@ -583,7 +589,7 @@ MIMPI_Retcode MIMPI_Recv(
         m = m->next;
     }
 
-    if (deadlock_on && is_message_from_source(source)) {
+    if (deadlock_on && is_message_from_source(source) && tag >= 0) {
         ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
         return MIMPI_ERROR_DEADLOCK_DETECTED;
     }
@@ -607,7 +613,7 @@ MIMPI_Retcode MIMPI_Barrier() {
 
         int partner = (world_rank + (1 << i)) % world_size;
     
-        if (value_to_return == MIMPI_SUCCESS)
+        if (value_to_return == MIMPI_SUCCESS) 
             ret = MIMPI_Send(NULL, 0, partner, BARRIER_TAG);
         else if (value_to_return == MIMPI_ERROR_REMOTE_FINISHED) 
             MIMPI_Send(NULL, 0, partner, BROKEN_BARRIER_TAG);
@@ -616,7 +622,7 @@ MIMPI_Retcode MIMPI_Barrier() {
 
         int previous = (world_rank - (1 << i) + world_size) % world_size;
 
-        if (value_to_return == MIMPI_SUCCESS) 
+        if (value_to_return == MIMPI_SUCCESS)           
             ret = MIMPI_Recv(NULL, 0, previous, BARRIER_TAG);
         if (ret == MIMPI_ERROR_REMOTE_FINISHED) 
             value_to_return = MIMPI_ERROR_REMOTE_FINISHED;
