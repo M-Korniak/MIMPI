@@ -136,22 +136,15 @@ static void* reading_thread(void* data) {
     void* buffer = receive_buffer[source];
     while(true) {
         // Tag
-        int ret = chrecv(read_pipe, buffer, sizeof(int));
+        int ret = chrecv(read_pipe, buffer, 2 * sizeof(int));
         if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
             actualize_finished_processes(source);
             break;
         }
         ASSERT_SYS_OK(ret);
         int tag = *(int*)buffer;
+        int count = *(int*)(buffer + sizeof(int));
     
-        // Count
-        ret = chrecv(read_pipe, buffer, sizeof(int));
-        if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
-            actualize_finished_processes(source);
-            break;
-        }
-        ASSERT_SYS_OK(ret);
-        int count = *(int*)buffer;
         if (tag == BARRIER_TAG) {
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
@@ -452,6 +445,19 @@ MIMPI_Retcode MIMPI_Send(
     if (destination == world_rank) {
         return MIMPI_ERROR_ATTEMPTED_SELF_OP;
     }
+
+    // take mutex
+    ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
+
+    // Check if destination is finished
+    if (finished_processes[destination] == 1) {
+        // Mutex unlock
+        ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
+        return MIMPI_ERROR_REMOTE_FINISHED;
+    }
+
+    // Mutex unlock
+    ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
 
     int const initial_count = count;
 
