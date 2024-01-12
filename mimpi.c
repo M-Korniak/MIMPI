@@ -136,7 +136,7 @@ static void* reading_thread(void* data) {
     void* buffer = receive_buffer[source];
     while(true) {
         // Tag
-        int ret = chrecv(read_pipe, buffer, 2 * sizeof(int));
+        int ret = chrecv(read_pipe, buffer, 3 * sizeof(int));
         if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
             actualize_finished_processes(source);
             break;
@@ -144,7 +144,8 @@ static void* reading_thread(void* data) {
         ASSERT_SYS_OK(ret);
         int tag = *(int*)buffer;
         int count = *(int*)(buffer + sizeof(int));
-    
+        int to_read = *(int*)(buffer + 2 * sizeof(int));
+
         if (tag == BARRIER_TAG) {
             // Mutex lock
             ASSERT_SYS_OK(pthread_mutex_lock(&mutex));
@@ -221,14 +222,6 @@ static void* reading_thread(void* data) {
             ASSERT_SYS_OK(pthread_mutex_unlock(&mutex));
             continue;
         }
-        // Bytes to read
-        ret = chrecv(read_pipe, buffer, sizeof(int));
-        if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
-            actualize_finished_processes(source);
-            break;
-        }
-        ASSERT_SYS_OK(ret);
-        int to_read = *(int*)buffer;
         // Read data
         ret = chrecv(read_pipe, buffer, to_read);
         if ((ret == -1 && (errno == EBADF || errno == EPIPE)) || ret == 0) {
@@ -466,7 +459,8 @@ MIMPI_Retcode MIMPI_Send(
     *(int*)(send_buffer + sizeof(int)) = count;
 
     if (count == 0 || data == NULL) {
-        int ret = chsend(write_pipe_dsc[destination], send_buffer, 2 * sizeof(int));
+        *(int*)(send_buffer + 2 * sizeof(int)) = 0;
+        int ret = chsend(write_pipe_dsc[destination], send_buffer, 3 * sizeof(int));
         if (ret == -1 && (errno == EBADF || errno == EPIPE)) {
             return MIMPI_ERROR_REMOTE_FINISHED;
         }
